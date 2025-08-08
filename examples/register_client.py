@@ -8,7 +8,7 @@ import httpx
 
 async def register_client():
     # Server URL
-    base_url = "https://auth.your-domain.com"  # Replace with your domain
+    api_url = "https://auth.your-domain.com"  # Replace with your domain
 
     # Client registration data
     registration_data = {
@@ -26,7 +26,7 @@ async def register_client():
         try:
             # Register the client
             response = await client.post(
-                f"{base_url}/register",
+                f"{api_url}/register",
                 json=registration_data,
                 headers={"Content-Type": "application/json"},
             )

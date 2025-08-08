@@ -80,13 +80,13 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
     @router.get("/.well-known/oauth-authorization-server")
     async def oauth_metadata():
         """Server metadata shrine - reveals our OAuth capabilities"""
-        base_url = f"https://auth.{settings.base_domain}"
+        api_url = f"https://auth.{settings.base_domain}"
         return {
-            "issuer": base_url,
-            "authorization_endpoint": f"{base_url}/authorize",
-            "token_endpoint": f"{base_url}/token",
-            "registration_endpoint": f"{base_url}/register",
-            "jwks_uri": f"{base_url}/jwks",
+            "issuer": api_url,
+            "authorization_endpoint": f"{api_url}/authorize",
+            "token_endpoint": f"{api_url}/token",
+            "registration_endpoint": f"{api_url}/register",
+            "jwks_uri": f"{api_url}/jwks",
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["HS256", "RS256"],
@@ -95,11 +95,11 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             "claims_supported": ["sub", "name", "email", "preferred_username", "aud", "azp"],
             "code_challenge_methods_supported": ["S256"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
-            "revocation_endpoint": f"{base_url}/revoke",
-            "introspection_endpoint": f"{base_url}/introspect",
-            "service_documentation": f"{base_url}/docs",
-            "op_policy_uri": f"{base_url}/policy",
-            "op_tos_uri": f"{base_url}/terms",
+            "revocation_endpoint": f"{api_url}/revoke",
+            "introspection_endpoint": f"{api_url}/introspect",
+            "service_documentation": f"{api_url}/docs",
+            "op_policy_uri": f"{api_url}/policy",
+            "op_tos_uri": f"{api_url}/terms",
             # RFC 8707 Resource Indicators
             "resource_indicators_supported": True,
             "resource_parameter_supported": True,
