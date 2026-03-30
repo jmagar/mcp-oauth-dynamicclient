@@ -38,7 +38,7 @@ This blessed service implements:
 - `/authorize` - Authorization endpoint (initiates GitHub OAuth)
 - `/token` - Token endpoint (exchanges codes for JWTs)
 - `/callback` - GitHub OAuth callback
-- `/verify` - ForwardAuth verification for Traefik
+- `/verify` - SWAG auth_request verification for nginx
 
 **📜 RFC 7591 Dynamic Registration:**
 - `POST /register` - PUBLIC endpoint for client registration
@@ -72,11 +72,35 @@ else:
 
 ```
 oauth:state:{state}          # 5 minute TTL - CSRF protection
-oauth:code:{code}            # 1 year TTL - Authorization codes
+oauth:code:{code}            # 10 minute TTL - Authorization codes
 oauth:token:{jti}            # 30 days TTL - JWT access tokens
 oauth:refresh:{token}        # 1 year TTL - Refresh tokens
 oauth:client:{client_id}     # Client lifetime - Includes registration_access_token!
 oauth:user_tokens:{username} # No expiry - Index of user's tokens
+```
+
+### Client ID Metadata Document Support (MCP 2025-11-25)
+
+**⚡ Native MCP clients use HTTPS URLs as client_id — no pre-registration needed! ⚡**
+
+- **Auto-fetch**: When `client_id` is an HTTPS URL, the auth server fetches `{client_id}/.well-known/oauth-client-id-metadata` during `/authorize` and `/token`!
+- **Public clients**: `token_endpoint_auth_method: none` — no `client_secret` required!
+- **PKCE required**: Public clients must provide S256 PKCE challenge (OAuth 2.1 §4.1.1)!
+- **Loopback port flexibility**: `http://127.0.0.1` and `http://localhost` redirect URIs accept any port per RFC 8252 §7.3!
+- **Refresh token rotation**: Public clients receive a new refresh token on every use (OAuth 2.1 §4.3.1)!
+
+**Public client flow example:**
+```python
+# client_id is an HTTPS URL — no registration needed!
+# Gateway auto-fetches https://your-app.example.com/.well-known/oauth-client-id-metadata
+params = {
+    "client_id": "https://your-app.example.com",
+    "redirect_uri": "http://127.0.0.1:8085/callback",  # any port allowed
+    "code_challenge": s256_challenge,
+    "code_challenge_method": "S256",
+    "response_type": "code",
+}
+# Token endpoint: no client_secret needed for public clients!
 ```
 
 ### The Divine Client Lifecycle
@@ -209,23 +233,30 @@ logger.info(
     "AUTH REQUEST - Method: %s | Path: %s | Real-IP: %s | JSON: %s",
     request.method,
     request.url.path,
-    traefik_headers.get("x-real-ip", "unknown"),
+    proxy_headers.get("x-real-ip", "unknown"),
     json.dumps(request_data),
 )
 ```
 
 ## Integration with the Gateway
 
-### The Divine Traefik Labels
+### SWAG nginx Configuration
 
-```yaml
-# Auth service gets priority 4 (highest!)
-- "traefik.http.routers.auth-oauth.priority=4"
-- "traefik.http.routers.auth-oauth.rule=PathPrefix(`/register`) || PathPrefix(`/authorize`) || PathPrefix(`/token`) || PathPrefix(`/callback`) || PathPrefix(`/.well-known`)"
-
-# ForwardAuth middleware configuration
-- "traefik.http.middlewares.mcp-auth.forwardauth.address=http://auth:8000/verify"
-- "traefik.http.middlewares.mcp-auth.forwardauth.authResponseHeaders=X-User-Id,X-User-Name,X-Auth-Token"
+```nginx
+# /config/nginx/proxy-confs/mcp-service.subdomain.conf
+location = /_oauth_verify {
+    internal;
+    proxy_pass http://auth:8000/verify;
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+location /mcp {
+    auth_request /_oauth_verify;
+    auth_request_set $auth_user $upstream_http_x_user_name;
+    proxy_set_header X-User-Name $auth_user;
+    proxy_pass http://mcp-service:3000;
+}
 ```
 
 ### The Sacred Environment Variables
@@ -346,7 +377,7 @@ async def register_client():
 - ✅ **JWT with RS256** - Cryptographically blessed tokens!
 - ✅ **Redis Storage** - Sacred key patterns maintained!
 - ✅ **Authlib Security** - No ad-hoc implementations!
-- ✅ **ForwardAuth Ready** - Traefik integration blessed!
+- ✅ **SWAG auth_request Ready** - nginx integration blessed!
 - ✅ **No Defaults** - All config from environment!
 - ✅ **Real Testing** - No mocks, real Redis only!
 

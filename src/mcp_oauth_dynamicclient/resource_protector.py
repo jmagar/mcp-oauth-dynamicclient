@@ -5,8 +5,12 @@ Following security best practices - NO AD-HOC IMPLEMENTATIONS!
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import logging
+
 import redis.asyncio as redis
 from authlib.jose import JsonWebToken
+
+logger = logging.getLogger(__name__)
 from authlib.jose.errors import JoseError
 from authlib.oauth2 import ResourceProtector
 from authlib.oauth2.rfc6750 import BearerTokenValidator
@@ -47,10 +51,11 @@ class JWTBearerTokenValidator(BearerTokenValidator):
                     claims_options={
                         "iss": {
                             "essential": True,
-                            "value": f"https://auth.{self.settings.base_domain}",
+                            "value": f"https://{self.settings.auth_subdomain}.{self.settings.base_domain}",
                         },
                         "exp": {"essential": True},
                         "jti": {"essential": True},
+                        "aud": {"essential": True},
                     },
                 )
             else:
@@ -61,10 +66,11 @@ class JWTBearerTokenValidator(BearerTokenValidator):
                     claims_options={
                         "iss": {
                             "essential": True,
-                            "value": f"https://auth.{self.settings.base_domain}",
+                            "value": f"https://{self.settings.auth_subdomain}.{self.settings.base_domain}",
                         },
                         "exp": {"essential": True},
                         "jti": {"essential": True},
+                        "aud": {"essential": True},
                     },
                 )
 
@@ -76,18 +82,21 @@ class JWTBearerTokenValidator(BearerTokenValidator):
             token_data = await self.redis_client.get(f"oauth:token:{jti}")
 
             if not token_data:
-                # Token has been revoked or doesn't exist
+                logger.warning(f"Token revoked or missing from Redis: jti={jti}")
                 return None
 
+            logger.debug(
+                f"Token validated: jti={jti}, sub={claims.get('sub')}, "
+                f"aud={claims.get('aud')}, scope={claims.get('scope')}"
+            )
             # Return claims as dict for ResourceProtector
             return dict(claims)
 
         except JoseError as e:
-            # Token validation failed
-            print(f"JWT validation error: {e}")
+            logger.warning(f"JWT validation failed: {e}")
             return None
         except Exception as e:
-            print(f"Unexpected error during token validation: {e}")
+            logger.warning(f"Unexpected token validation error: {e}")
             return None
 
     def request_invalid(self, request) -> Optional[str]:
@@ -130,7 +139,7 @@ class IntrospectionBearerTokenValidator(JWTBearerTokenValidator):
                     claims_options={
                         "iss": {
                             "essential": True,
-                            "value": f"https://auth.{self.settings.base_domain}",
+                            "value": f"https://{self.settings.auth_subdomain}.{self.settings.base_domain}",
                         },
                         "jti": {"essential": True},
                         "exp": {"essential": False},  # Don't require valid exp for introspection
@@ -143,7 +152,7 @@ class IntrospectionBearerTokenValidator(JWTBearerTokenValidator):
                     claims_options={
                         "iss": {
                             "essential": True,
-                            "value": f"https://auth.{self.settings.base_domain}",
+                            "value": f"https://{self.settings.auth_subdomain}.{self.settings.base_domain}",
                         },
                         "jti": {"essential": True},
                         "exp": {"essential": False},

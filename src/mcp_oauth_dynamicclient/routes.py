@@ -91,7 +91,8 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["HS256", "RS256"],
             "scopes_supported": ["openid", "profile", "email", "mcp:read", "mcp:write", "mcp:session"],
-            "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+            "client_id_metadata_document_supported": True,
+            "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
             "claims_supported": ["sub", "name", "email", "preferred_username", "aud", "azp"],
             "code_challenge_methods_supported": ["S256"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
@@ -112,6 +113,30 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                 "audience_validation": True,
                 "resource_specific_tokens": True
             }
+        }
+
+    # OpenID Connect Discovery 1.0 compatibility (MCP 2025-11-25 spec requires both)
+    @router.get("/.well-known/openid-configuration")
+    async def openid_configuration():
+        """OpenID Connect Discovery 1.0 endpoint - required by MCP 2025-11-25 spec"""
+        base_url = f"https://{settings.auth_subdomain}.{settings.base_domain}"
+        return {
+            "issuer": base_url,
+            "authorization_endpoint": f"{base_url}/authorize",
+            "token_endpoint": f"{base_url}/token",
+            "registration_endpoint": f"{base_url}/register",
+            "jwks_uri": f"{base_url}/jwks",
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["HS256", "RS256"],
+            "scopes_supported": ["openid", "profile", "email", "mcp:read", "mcp:write"],
+            "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
+            "claims_supported": ["sub", "name", "email", "preferred_username"],
+            "code_challenge_methods_supported": ["S256"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "revocation_endpoint": f"{base_url}/revoke",
+            "introspection_endpoint": f"{base_url}/introspect",
+            "client_id_metadata_document_supported": True,
         }
 
     # JWKS endpoint for RS256 public key distribution
@@ -171,17 +196,49 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                     },
                 )
 
-        # Generate client credentials
-        credentials = auth_manager.generate_client_credentials()
-        client_id = credentials["client_id"]
-        client_secret = credentials["client_secret"]
+        # Determine registration mode: Client ID Metadata Document URL vs standard DCR
+        is_metadata_client = (
+            registration.client_id
+            and auth_manager.is_metadata_document_url(registration.client_id)
+        )
 
-        # Calculate client expiration time
         created_at = int(time.time())
-        expires_at = 0 if settings.client_lifetime == 0 else created_at + settings.client_lifetime
-
-        # Generate registration access token for RFC 7592 management
         registration_access_token = f"reg-{secrets.token_urlsafe(32)}"
+
+        if is_metadata_client:
+            # Client ID Metadata Document flow: use URL as client_id, public client
+            client_id = registration.client_id
+            client_secret = ""
+            expires_at = 0
+            token_endpoint_auth_method = "none"
+
+            # Fetch and validate the metadata document
+            metadata = await auth_manager.fetch_client_metadata(client_id)
+            if metadata:
+                # Use metadata from document (authoritative)
+                redirect_uris = metadata.get("redirect_uris", registration.redirect_uris)
+                client_name = metadata.get("client_name", registration.client_name)
+            else:
+                # Metadata fetch failed, use registration body as fallback
+                logger.warning(
+                    f"Could not fetch metadata for {client_id}, using registration body"
+                )
+                redirect_uris = registration.redirect_uris
+                client_name = registration.client_name
+        else:
+            # Standard RFC 7591 DCR: generate credentials
+            credentials = auth_manager.generate_client_credentials()
+            client_id = credentials["client_id"]
+            client_secret = credentials["client_secret"]
+            expires_at = (
+                0 if settings.client_lifetime == 0
+                else created_at + settings.client_lifetime
+            )
+            token_endpoint_auth_method = (
+                registration.token_endpoint_auth_method or "client_secret_post"
+            )
+            redirect_uris = registration.redirect_uris
+            client_name = registration.client_name
 
         # Store client in Redis
         client_data = {
@@ -189,39 +246,59 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             "client_secret": client_secret,
             "client_secret_expires_at": expires_at,
             "client_id_issued_at": created_at,
-            "redirect_uris": json.dumps(registration.redirect_uris),
-            "client_name": registration.client_name or "Unnamed Client",
+            "redirect_uris": json.dumps(redirect_uris or []),
+            "client_name": client_name or "Unnamed Client",
             "scope": registration.scope or "openid profile email",
             "created_at": created_at,
-            "response_types": json.dumps(["code"]),
-            "grant_types": json.dumps(["authorization_code", "refresh_token"]),
+            "response_types": json.dumps(
+                registration.response_types or ["code"]
+            ),
+            "grant_types": json.dumps(
+                registration.grant_types or ["authorization_code", "refresh_token"]
+            ),
             "registration_access_token": registration_access_token,
+            "token_endpoint_auth_method": token_endpoint_auth_method,
+            "is_metadata_document_client": is_metadata_client,
         }
 
         # Store with expiration matching client lifetime
-        if settings.client_lifetime > 0:
+        if is_metadata_client:
+            # Metadata document clients cached for 1 hour (re-fetch on expiry)
+            await redis_client.setex(
+                f"oauth:client:{client_id}", 3600, json.dumps(client_data)
+            )
+        elif settings.client_lifetime > 0:
             await redis_client.setex(
                 f"oauth:client:{client_id}",
                 settings.client_lifetime,
-                json.dumps(client_data),  # TODO: Break long line
+                json.dumps(client_data),
             )
         else:
-            await redis_client.set(f"oauth:client:{client_id}", json.dumps(client_data))
+            await redis_client.set(
+                f"oauth:client:{client_id}", json.dumps(client_data)
+            )
 
-        # Return registration response per RFC 7591
+        # Build registration response per RFC 7591
+        base_url = f"https://{settings.auth_subdomain}.{settings.base_domain}"
         response = {
             "client_id": client_id,
-            "client_secret": client_secret,
-            "client_secret_expires_at": expires_at,
             "client_id_issued_at": created_at,
-            "redirect_uris": registration.redirect_uris,
-            "client_name": registration.client_name,
-            "scope": registration.scope,
+            "redirect_uris": redirect_uris,
+            "client_name": client_name,
+            "scope": registration.scope or "openid profile email",
+            "token_endpoint_auth_method": token_endpoint_auth_method,
+            "grant_types": registration.grant_types or ["authorization_code", "refresh_token"],
+            "response_types": registration.response_types or ["code"],
             "registration_access_token": registration_access_token,
-            "registration_client_uri": f"https://auth.{settings.base_domain}/register/{client_id}",  # TODO: Break long line
+            "registration_client_uri": f"{base_url}/register/{client_id}",
         }
 
-        # Echo back all registered metadata
+        # Only include secret for confidential clients
+        if not is_metadata_client:
+            response["client_secret"] = client_secret
+            response["client_secret_expires_at"] = expires_at
+
+        # Echo back optional metadata
         for field in ["client_uri", "logo_uri", "contacts", "tos_uri", "policy_uri"]:
             value = getattr(registration, field, None)
             if value is not None:
@@ -243,10 +320,29 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
         redis_client: redis.Redis = Depends(get_redis),
     ):
         """Portal to authentication realm - initiates GitHub OAuth flow"""
-        # Validate client
-        client = await auth_manager.get_client(client_id, redis_client)
+        logger.info(
+            f"AUTHORIZE - client_id={client_id}, scope={scope}, resource={resource}, "
+            f"redirect_uri={redirect_uri}, code_challenge={'yes' if code_challenge else 'no'}"
+        )
+
+        # MCP spec requires PKCE (S256) - MUST refuse to proceed without it
+        if not code_challenge:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "invalid_request",
+                    "error_description": (
+                        "PKCE code_challenge is required. "
+                        "MCP clients MUST use S256 PKCE per the MCP authorization spec."
+                    ),
+                },
+            )
+
+        # Validate client - supports both registered clients and Client ID Metadata Documents
+        client = await auth_manager.get_or_fetch_client(client_id, redis_client)
         if not client:
             # RFC 6749 - MUST NOT redirect on invalid client_id
+            base_url = f"https://{settings.auth_subdomain}.{settings.base_domain}"
             return HTMLResponse(
                 status_code=400,
                 content=f"""
@@ -284,19 +380,17 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                 </head>
                 <body>
                     <div class="error-container">
-                        <h1>⚠️ OAuth Client Registration Invalid</h1>
-                        <p>The application attempting to connect has an invalid or expired client registration.</p>
-
+                        <h1>OAuth Client Not Found</h1>
+                        <p>The application could not be verified.</p>
                         <p><strong>Technical Details:</strong></p>
                         <ul>
                             <li>Error: <span class="error-code">invalid_client</span></li>
                             <li>Client ID: <span class="client-id">{client_id}</span></li>
                         </ul>
-
-                        <p style="margin-top: 30px; color: #666; font-size: 0.9em;">
-                            For developers: The client should POST to
-                            <code>https://auth.{settings.base_domain}/register</code>
-                            to obtain new credentials.
+                        <p style="margin-top: 20px; color: #666; font-size: 0.9em;">
+                            Supported client registration methods:<br>
+                            1. Client ID Metadata Documents (HTTPS URL as client_id)<br>
+                            2. Dynamic Client Registration (POST to <code>{base_url}/register</code>)
                         </p>
                     </div>
                 </body>
@@ -364,7 +458,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
         # Redirect to GitHub OAuth
         github_params = {
             "client_id": settings.github_client_id,
-            "redirect_uri": f"https://auth.{settings.base_domain}/callback",
+            "redirect_uri": f"https://{settings.auth_subdomain}.{settings.base_domain}/callback",
             "scope": "user:email",
             "state": auth_state,
         }
@@ -444,11 +538,12 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             "name": user_info.get("name", ""),
         }
 
+        # Auth codes MUST be short-lived (10 minutes) per OAuth 2.1 Section 4.1.2
         await redis_client.setex(
             f"oauth:code:{auth_code}",
-            31536000,
+            600,
             json.dumps(code_data),
-        )  # TODO: Break long line
+        )
 
         # Clean up state
         await redis_client.delete(f"oauth:state:{state}")
@@ -457,7 +552,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
         # Handle out-of-band redirect URI
         if auth_data["redirect_uri"] == "urn:ietf:wg:oauth:2.0:oob":
             return RedirectResponse(
-                url=f"https://auth.{settings.base_domain}/success?code={auth_code}&state={auth_data['state']}",  # TODO: Break long line
+                url=f"https://{settings.auth_subdomain}.{settings.base_domain}/success?code={auth_code}&state={auth_data['state']}",  # TODO: Break long line
                 headers={
                     "Cache-Control": "no-cache, no-store, must-revalidate",
                     "Pragma": "no-cache",
@@ -480,10 +575,11 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
     # Token endpoint
     @router.post("/token")
     async def token_exchange(
+        request: Request,
         grant_type: str = Form(...),
         code: Optional[str] = Form(None),
         redirect_uri: Optional[str] = Form(None),
-        client_id: str = Form(...),
+        client_id: Optional[str] = Form(None),
         client_secret: Optional[str] = Form(None),
         code_verifier: Optional[str] = Form(None),
         refresh_token: Optional[str] = Form(None),
@@ -491,8 +587,32 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
         redis_client: redis.Redis = Depends(get_redis),
     ):
         """The transmutation chamber - exchanges codes for tokens"""
-        # Validate client
-        client = await auth_manager.get_client(client_id, redis_client)
+        logger.info(f"TOKEN - grant_type={grant_type}, client_id={client_id}, resource={resource}")
+        import base64
+
+        # Support client_secret_basic: extract client_id/secret from Authorization header
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Basic ") and not client_id:
+            try:
+                decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+                basic_client_id, basic_client_secret = decoded.split(":", 1)
+                client_id = basic_client_id
+                if not client_secret:
+                    client_secret = basic_client_secret
+            except Exception:
+                pass
+
+        if not client_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "invalid_request",
+                    "error_description": "client_id is required (via form body or Basic auth header)",
+                },
+            )
+
+        # Validate client - supports Client ID Metadata Document URLs
+        client = await auth_manager.get_or_fetch_client(client_id, redis_client)
         if not client:
             raise HTTPException(
                 status_code=401,
@@ -503,8 +623,12 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                 headers={"WWW-Authenticate": "Basic"},
             )
 
-        # Validate client secret
-        if client_secret and not client.check_client_secret(client_secret):
+        # Validate client secret (skip for public clients per OAuth 2.1)
+        if client.is_public_client():
+            # Public clients (token_endpoint_auth_method=none) don't use secrets
+            if client_secret:
+                logger.warning(f"Public client {client_id} sent a client_secret (ignored)")
+        elif client_secret and not client.check_client_secret(client_secret):
             raise HTTPException(
                 status_code=401,
                 detail={
@@ -554,34 +678,42 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                     detail={"error": "invalid_grant", "error_description": "Redirect URI mismatch"},
                 )
 
-            # Validate PKCE
-            if code_data.get("code_challenge"):
-                if not code_verifier:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "error": "invalid_grant",
-                            "error_description": "PKCE code_verifier required",
-                        },
-                    )
+            # PKCE is REQUIRED per MCP authorization spec
+            if not code_data.get("code_challenge"):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "invalid_grant",
+                        "error_description": "Authorization was not initiated with PKCE",
+                    },
+                )
 
-                if not auth_manager.verify_pkce_challenge(
-                    code_verifier,
-                    code_data["code_challenge"],
-                    code_data["code_challenge_method"],
-                ):
-                    raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "error": "invalid_grant",
-                            "error_description": "PKCE verification failed",
-                        },
-                    )
+            if not code_verifier:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "invalid_grant",
+                        "error_description": "PKCE code_verifier required",
+                    },
+                )
+
+            if not auth_manager.verify_pkce_challenge(
+                code_verifier,
+                code_data["code_challenge"],
+                code_data["code_challenge_method"],
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "invalid_grant",
+                        "error_description": "PKCE verification failed",
+                    },
+                )
 
             # Validate resource parameters (RFC 8707)
             authorized_resources = code_data.get("resources", [])
             requested_resources = resource if resource else []
-            
+
             # If resources were requested at token endpoint, ensure they were authorized
             if requested_resources:
                 for res in requested_resources:
@@ -599,6 +731,9 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                 # Use all authorized resources if none specifically requested
                 token_resources = authorized_resources
 
+            # token_resource for JWT audience (first resource or None)
+            token_resource = token_resources[0] if token_resources else None
+
             # Generate tokens
             access_token = await auth_manager.create_jwt_token(
                 {
@@ -611,6 +746,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                     "resources": token_resources,  # RFC 8707 Resource Indicators
                 },
                 redis_client,
+                resource=token_resource,
             )
 
             refresh_token_value = await auth_manager.create_refresh_token(
@@ -684,11 +820,29 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                     "resources": token_resources,  # RFC 8707 Resource Indicators
                 },
                 redis_client,
+                resource=resource,
             )
+
+            # OAuth 2.1 Section 4.3.1: For public clients, MUST rotate refresh tokens
+            new_refresh_token = None
+            if client.is_public_client():
+                # Revoke old refresh token
+                await redis_client.delete(f"oauth:refresh:{refresh_token}")
+                # Issue new refresh token
+                new_refresh_token = await auth_manager.create_refresh_token(
+                    {
+                        "user_id": refresh_data["user_id"],
+                        "username": refresh_data["username"],
+                        "client_id": client_id,
+                        "scope": refresh_data["scope"],
+                    },
+                    redis_client,
+                )
 
             return TokenResponse(
                 access_token=access_token,
                 expires_in=settings.access_token_lifetime,
+                refresh_token=new_refresh_token,
                 scope=refresh_data["scope"],
             )
 
@@ -748,9 +902,9 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
         client_secret: Optional[str] = Form(None),
         redis_client: redis.Redis = Depends(get_redis),
     ):
-        """Token banishment altar - revokes tokens"""
-        # Validate client
-        client = await auth_manager.get_client(client_id, redis_client)
+        """Token revocation - RFC 7009 compliant"""
+        # Validate client (supports URL-format client_ids)
+        client = await auth_manager.get_or_fetch_client(client_id, redis_client)
         if not client:
             # RFC 7009 - invalid client should still return 200
             return Response(status_code=200)
@@ -773,9 +927,9 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
         client_secret: Optional[str] = Form(None),
         redis_client: redis.Redis = Depends(get_redis),
     ):
-        """Token examination oracle - RFC 7662 compliant"""
-        # Validate client
-        client = await auth_manager.get_client(client_id, redis_client)
+        """Token introspection - RFC 7662 compliant"""
+        # Validate client (supports URL-format client_ids)
+        client = await auth_manager.get_or_fetch_client(client_id, redis_client)
         if not client or (client_secret and not client.check_client_secret(client_secret)):
             return {"active": False}
 

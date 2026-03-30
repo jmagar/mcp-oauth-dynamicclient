@@ -9,7 +9,7 @@ A production-ready OAuth 2.1 authorization server with RFC 7591 dynamic client r
 - **Client Management Protocol** - RFC 7592 compliant CRUD operations
 - **GitHub OAuth Integration** - User authentication via GitHub
 - **JWT Token Management** - RS256 (recommended) and HS256 support
-- **ForwardAuth Compatible** - Works seamlessly with Traefik
+- **SWAG/nginx auth_request compatible** - Works seamlessly with SWAG reverse proxy
 - **Redis State Storage** - Scalable token and client storage
 - **Token Introspection** - RFC 7662 compliant token validation
 - **Token Revocation** - RFC 7009 compliant token lifecycle
@@ -211,24 +211,24 @@ services:
       - redis
     networks:
       - internal
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.auth.rule=Host(`auth.${BASE_DOMAIN}`)"
-      - "traefik.http.routers.auth.tls=true"
-      - "traefik.http.routers.auth.tls.certresolver=letsencrypt"
 ```
 
-## Traefik Integration
+## SWAG Integration
 
-Configure Traefik to use this service for authentication:
+Configure SWAG to use this service for authentication via nginx `auth_request`:
 
-```yaml
-# ForwardAuth middleware
-- "traefik.http.middlewares.auth.forwardauth.address=http://auth:8000/verify"
-- "traefik.http.middlewares.auth.forwardauth.authResponseHeaders=X-User-Id,X-User-Name,X-Auth-Token"
-
-# Apply to protected services
-- "traefik.http.routers.myservice.middlewares=auth"
+```nginx
+# Add to your service's nginx proxy-conf
+location = /_oauth_verify {
+    internal;
+    proxy_pass http://auth:8000/verify;
+    proxy_set_header Authorization $http_authorization;
+}
+# Apply auth_request to protected routes
+location /mcp {
+    auth_request /_oauth_verify;
+    proxy_pass http://your-service:PORT;
+}
 ```
 
 ## Development

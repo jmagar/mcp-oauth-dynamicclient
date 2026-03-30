@@ -9,6 +9,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .auth_authlib import AuthManager
@@ -253,6 +254,25 @@ def create_app(settings: Settings = None) -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Handle FastAPI validation errors as OAuth-formatted responses
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        """Convert FastAPI validation errors to OAuth 2.1 error format"""
+        missing_fields = [
+            e["loc"][-1] for e in exc.errors() if e["type"] == "missing"
+        ]
+        if missing_fields:
+            desc = f"Missing required fields: {', '.join(str(f) for f in missing_fields)}"
+        else:
+            desc = "; ".join(e["msg"] for e in exc.errors())
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_request",
+                "error_description": desc,
+            },
+        )
+
     # Add custom exception handler for 401 errors
     @app.exception_handler(HTTPException)
     async def http_exception_handler(request: Request, exc: HTTPException):
@@ -276,43 +296,65 @@ def create_app(settings: Settings = None) -> FastAPI:
             headers=exc.headers,
         )
 
-    # CORS is handled by Traefik middleware - no need to configure here
-    # This ensures CORS headers are set in only one place as required
+    # CORS configuration - required when not behind a proxy that handles CORS
+    cors_origins_str = os.environ.get("MCP_CORS_ORIGINS", "*")
+    if cors_origins_str == "*":
+        cors_origins = ["*"]
+    else:
+        cors_origins = [o.strip() for o in cors_origins_str.split(",")]
 
-    # Add request logging middleware to capture Traefik forwarded headers
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Accept", "MCP-Protocol-Version", "Mcp-Session-Id", "Last-Event-ID"],
+        expose_headers=["MCP-Protocol-Version", "Mcp-Session-Id"],
+    )
+
+    # Add request logging middleware to capture proxy forwarded headers
     @app.middleware("http")
-    async def log_traefik_headers(request: Request, call_next):
-        """Log Traefik forwarded headers and request details for security monitoring."""
+    async def log_proxy_headers(request: Request, call_next):
+        """Log proxy forwarded headers and request details for security monitoring.
+
+        Works with any reverse proxy (Traefik, SWAG/nginx, Caddy, etc.).
+        All forwarded headers are treated as optional since different proxies
+        set different subsets (e.g. x-forwarded-server is Traefik-specific and
+        is NOT set by SWAG/nginx).
+        """
         logger = logging.getLogger(__name__)
         start_time = time.time()
 
-        # Extract Traefik forwarded headers
-        traefik_headers = {
+        # Extract proxy forwarded headers — all are optional; different proxies
+        # set different subsets.  x-forwarded-server is Traefik-specific and
+        # will be absent when running behind SWAG/nginx.
+        proxy_headers = {
             "x-real-ip": request.headers.get("x-real-ip"),
             "x-forwarded-for": request.headers.get("x-forwarded-for"),
             "x-forwarded-host": request.headers.get("x-forwarded-host"),
             "x-forwarded-proto": request.headers.get("x-forwarded-proto"),
             "x-forwarded-port": request.headers.get("x-forwarded-port"),
-            "x-forwarded-server": request.headers.get("x-forwarded-server"),
+            "x-forwarded-server": request.headers.get("x-forwarded-server", ""),
             "user-agent": request.headers.get("user-agent"),
             "host": request.headers.get("host"),
         }
 
-        # Filter out None values
-        traefik_headers = {k: v for k, v in traefik_headers.items() if v is not None}
+        # Filter out None values (empty string is kept — means header was absent)
+        proxy_headers = {k: v for k, v in proxy_headers.items() if v is not None}
 
-        # Log request with Traefik headers
+        # Log request with proxy headers
         request_data = {
             "type": "auth_request",
             "method": request.method,
             "path": str(request.url.path),
-            "real_ip": traefik_headers.get("x-real-ip", "unknown"),
-            "forwarded_for": traefik_headers.get("x-forwarded-for", "unknown"),
-            "forwarded_host": traefik_headers.get("x-forwarded-host", "unknown"),
-            "host": traefik_headers.get("host", "unknown"),
-            "user_agent": traefik_headers.get("user-agent", "unknown"),
-            "forwarded_proto": traefik_headers.get("x-forwarded-proto", "unknown"),
-            "forwarded_port": traefik_headers.get("x-forwarded-port", "unknown"),
+            "real_ip": proxy_headers.get("x-real-ip", "unknown"),
+            "forwarded_for": proxy_headers.get("x-forwarded-for", "unknown"),
+            "forwarded_host": proxy_headers.get("x-forwarded-host", "unknown"),
+            "host": proxy_headers.get("host", "unknown"),
+            "user_agent": proxy_headers.get("user-agent", "unknown"),
+            "forwarded_proto": proxy_headers.get("x-forwarded-proto", "unknown"),
+            "forwarded_port": proxy_headers.get("x-forwarded-port", "unknown"),
         }
         logger.info(
             "AUTH REQUEST - Method: %s | "
@@ -324,10 +366,10 @@ def create_app(settings: Settings = None) -> FastAPI:
             "JSON: %s",
             request.method,
             request.url.path,
-            traefik_headers.get("x-real-ip", "unknown"),
-            traefik_headers.get("x-forwarded-for", "unknown"),
-            traefik_headers.get("x-forwarded-host", traefik_headers.get("host", "unknown")),
-            traefik_headers.get("user-agent", "unknown"),
+            proxy_headers.get("x-real-ip", "unknown"),
+            proxy_headers.get("x-forwarded-for", "unknown"),
+            proxy_headers.get("x-forwarded-host", proxy_headers.get("host", "unknown")),
+            proxy_headers.get("user-agent", "unknown"),
             json.dumps(request_data),
         )
 
@@ -343,7 +385,7 @@ def create_app(settings: Settings = None) -> FastAPI:
             "status": response.status_code,
             "duration_seconds": round(process_time, 3),
             "path": str(request.url.path),
-            "real_ip": traefik_headers.get("x-real-ip", "unknown"),
+            "real_ip": proxy_headers.get("x-real-ip", "unknown"),
             "method": request.method,
         }
         logger.info(
@@ -351,7 +393,7 @@ def create_app(settings: Settings = None) -> FastAPI:
             response.status_code,
             process_time,
             request.url.path,
-            traefik_headers.get("x-real-ip", "unknown"),
+            proxy_headers.get("x-real-ip", "unknown"),
             json.dumps(response_data),
         )
 

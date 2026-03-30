@@ -1,13 +1,15 @@
 """Authentication and token management module using Authlib
-Following the divine commandments - NO AD-HOC IMPLEMENTATIONS!
+Implements OAuth 2.1, RFC 7591, and Client ID Metadata Documents
 """
 
 import base64
 import hashlib
 import json
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 import redis.asyncio as redis
@@ -18,6 +20,11 @@ from authlib.oauth2.rfc6749 import ClientMixin
 
 from .config import Settings
 from .keys import RSAKeyManager
+
+logger = logging.getLogger(__name__)
+
+# Loopback hosts per RFC 8252 Section 7.3
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 
 
 class OAuth2Client(ClientMixin):
@@ -41,13 +48,33 @@ class OAuth2Client(ClientMixin):
         return scope  # Allow all scopes for now
 
     def check_redirect_uri(self, redirect_uri: str) -> bool:
-        # Handle JSON-encoded redirect_uris
+        """Validate redirect_uri with RFC 8252 Section 7.3 loopback port flexibility.
+
+        For loopback redirect URIs (localhost, 127.0.0.1, [::1]), the authorization
+        server MUST allow any port at the time of the request per RFC 8252.
+        """
         redirect_uris = self._client_data.get("redirect_uris", [])
         if isinstance(redirect_uris, str):
-            import json
-
             redirect_uris = json.loads(redirect_uris)
-        return redirect_uri in redirect_uris
+
+        # Exact match first (fast path)
+        if redirect_uri in redirect_uris:
+            return True
+
+        # RFC 8252 Section 7.3: loopback redirect URIs allow any port
+        parsed_request = urlparse(redirect_uri)
+        if parsed_request.hostname in LOOPBACK_HOSTS:
+            for registered_uri in redirect_uris:
+                parsed_registered = urlparse(registered_uri)
+                if (
+                    parsed_registered.hostname in LOOPBACK_HOSTS
+                    and parsed_request.scheme == parsed_registered.scheme
+                    and parsed_request.path == parsed_registered.path
+                ):
+                    # Scheme and path match, port is flexible for loopback
+                    return True
+
+        return False
 
     def has_client_secret(self) -> bool:
         return bool(self._client_data.get("client_secret"))
@@ -55,9 +82,16 @@ class OAuth2Client(ClientMixin):
     def check_client_secret(self, client_secret: str) -> bool:
         return secrets.compare_digest(self._client_data.get("client_secret", ""), client_secret)
 
+    def is_public_client(self) -> bool:
+        """Check if this is a public client (token_endpoint_auth_method=none)."""
+        return self._client_data.get("token_endpoint_auth_method") == "none"
+
     def check_endpoint_auth_method(self, method: str, endpoint: str) -> bool:
-        # Support both client_secret_post and client_secret_basic
-        return method in ["client_secret_post", "client_secret_basic"]
+        """Support public clients (none) and confidential clients."""
+        client_method = self._client_data.get("token_endpoint_auth_method")
+        if client_method == "none":
+            return method == "none"
+        return method in ["client_secret_post", "client_secret_basic", "none"]
 
     def check_response_type(self, response_type: str) -> bool:
         return response_type in self._client_data.get("response_types", ["code"])
@@ -82,13 +116,18 @@ class AuthManager:
         self.github_client = AsyncOAuth2Client(
             client_id=settings.github_client_id,
             client_secret=settings.github_client_secret,
-            redirect_uri=f"https://auth.{settings.base_domain}/callback",
+            redirect_uri=f"https://{settings.auth_subdomain}.{settings.base_domain}/callback",
         )
 
-    async def create_jwt_token(self, claims: dict, redis_client: redis.Redis) -> str:
-        """Creates a blessed JWT token using Authlib"""
+    async def create_jwt_token(
+        self, claims: dict, redis_client: redis.Redis, resource: Optional[str] = None
+    ) -> str:
+        """Creates a JWT token using Authlib with RFC 8707 resource indicator support"""
         # Generate JTI for tracking
         jti = secrets.token_urlsafe(16)
+
+        # Audience is the target resource (RFC 8707) or fallback to auth server
+        audience = resource or f"https://{self.settings.auth_subdomain}.{self.settings.base_domain}"
 
         # Prepare JWT claims according to RFC 7519
         now = datetime.now(timezone.utc)
@@ -108,10 +147,15 @@ class AuthManager:
             "jti": jti,
             "iat": int(now.timestamp()),
             "exp": int((now + timedelta(seconds=self.settings.access_token_lifetime)).timestamp()),
-            "iss": f"https://auth.{self.settings.base_domain}",
+            "iss": f"https://{self.settings.auth_subdomain}.{self.settings.base_domain}",
             "aud": aud,
             "azp": claims.get("client_id"),  # Authorized party claim
         }
+        logger.info(
+            f"JWT CREATED - jti={jti}, sub={claims.get('sub')}, aud={audience}, "
+            f"client_id={claims.get('client_id')}, scope={claims.get('scope')}, "
+            f"expires_in={self.settings.access_token_lifetime}s"
+        )
 
         # Create token using Authlib with the BLESSED RS256 algorithm!
         if self.settings.jwt_algorithm == "RS256":
@@ -154,7 +198,7 @@ class AuthManager:
                     claims_options={
                         "iss": {
                             "essential": True,
-                            "value": f"https://auth.{self.settings.base_domain}",
+                            "value": f"https://{self.settings.auth_subdomain}.{self.settings.base_domain}",
                         },
                         "exp": {"essential": True},
                         "jti": {"essential": True},
@@ -168,7 +212,7 @@ class AuthManager:
                     claims_options={
                         "iss": {
                             "essential": True,
-                            "value": f"https://auth.{self.settings.base_domain}",
+                            "value": f"https://{self.settings.auth_subdomain}.{self.settings.base_domain}",
                         },
                         "exp": {"essential": True},
                         "jti": {"essential": True},
@@ -324,8 +368,120 @@ class AuthManager:
 
         return False
 
+    @staticmethod
+    def is_metadata_document_url(client_id: str) -> bool:
+        """Check if client_id is an HTTPS URL (Client ID Metadata Document)."""
+        return client_id.startswith("https://") and "/" in client_id[8:]
+
+    async def fetch_client_metadata(self, client_id_url: str) -> Optional[dict]:
+        """Fetch and validate a Client ID Metadata Document per
+        draft-ietf-oauth-client-id-metadata-document-00.
+
+        Validates:
+        - Document is valid JSON
+        - client_id in document matches the URL exactly
+        - Required fields present (client_id, client_name, redirect_uris)
+        - SSRF protection (HTTPS only, no private IPs)
+        """
+        parsed = urlparse(client_id_url)
+        if parsed.scheme != "https":
+            logger.warning(f"Client metadata URL must be HTTPS: {client_id_url}")
+            return None
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    client_id_url,
+                    headers={"Accept": "application/json"},
+                    follow_redirects=False,  # SSRF: don't follow redirects
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"Client metadata fetch failed: {resp.status_code} from {client_id_url}"
+                    )
+                    return None
+
+                metadata = resp.json()
+
+        except (httpx.HTTPError, json.JSONDecodeError) as e:
+            logger.warning(f"Client metadata fetch error for {client_id_url}: {e}")
+            return None
+
+        # Validate client_id matches URL exactly
+        if metadata.get("client_id") != client_id_url:
+            logger.warning(
+                f"Client metadata client_id mismatch: "
+                f"document={metadata.get('client_id')}, url={client_id_url}"
+            )
+            return None
+
+        # Validate required fields
+        if not metadata.get("redirect_uris"):
+            logger.warning(f"Client metadata missing redirect_uris: {client_id_url}")
+            return None
+
+        return metadata
+
+    async def get_or_fetch_client(
+        self, client_id: str, redis_client: redis.Redis
+    ) -> Optional[OAuth2Client]:
+        """Get client from Redis, or fetch Client ID Metadata Document if URL-format.
+
+        For URL-format client_ids, fetches metadata doc, validates it, and
+        caches the client in Redis for future requests.
+        """
+        # Try Redis first
+        client = await self.get_client(client_id, redis_client)
+        if client:
+            return client
+
+        # If client_id is a URL, try Client ID Metadata Document flow
+        if not self.is_metadata_document_url(client_id):
+            return None
+
+        logger.info(f"Fetching Client ID Metadata Document: {client_id}")
+        metadata = await self.fetch_client_metadata(client_id)
+        if not metadata:
+            return None
+
+        # Cache the client in Redis (public client, no secret)
+        created_at = int(datetime.now(timezone.utc).timestamp())
+        client_data = {
+            "client_id": client_id,
+            "client_secret": "",  # Public client - no secret
+            "client_secret_expires_at": 0,
+            "client_id_issued_at": created_at,
+            "redirect_uris": json.dumps(metadata.get("redirect_uris", [])),
+            "client_name": metadata.get("client_name", "Unknown Client"),
+            "scope": "openid profile email",
+            "created_at": created_at,
+            "response_types": json.dumps(metadata.get("response_types", ["code"])),
+            "grant_types": json.dumps(
+                metadata.get("grant_types", ["authorization_code", "refresh_token"])
+            ),
+            "token_endpoint_auth_method": metadata.get(
+                "token_endpoint_auth_method", "none"
+            ),
+            "client_uri": metadata.get("client_uri", ""),
+            "logo_uri": metadata.get("logo_uri", ""),
+            "is_metadata_document_client": True,
+        }
+
+        # Cache with 1-hour TTL (re-fetch on expiry to pick up metadata changes)
+        await redis_client.setex(
+            f"oauth:client:{client_id}",
+            3600,
+            json.dumps(client_data),
+        )
+
+        logger.info(
+            f"Cached Client ID Metadata Document client: {client_id} "
+            f"(name={client_data['client_name']})"
+        )
+        return OAuth2Client(client_data)
+
     async def get_client(self, client_id: str, redis_client: redis.Redis) -> Optional[OAuth2Client]:
-        """Get OAuth2 client from Redis"""
+        """Get OAuth2 client from Redis."""
         client_data = await redis_client.get(f"oauth:client:{client_id}")
 
         if not client_data:

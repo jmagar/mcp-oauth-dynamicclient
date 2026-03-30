@@ -20,6 +20,7 @@ class Settings(BaseSettings):
 
     # Domain Configuration
     base_domain: str
+    auth_subdomain: str = "auth"  # Subdomain prefix for auth service URLs
 
     # Redis Configuration
     redis_url: str
