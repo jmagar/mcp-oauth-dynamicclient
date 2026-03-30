@@ -2,6 +2,7 @@
 Using Authlib's security framework instead of custom implementations
 """
 
+import html
 import json
 import logging
 import secrets
@@ -793,6 +794,16 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
 
             refresh_data = json.loads(refresh_data_str)
 
+            # Verify refresh token was issued to the requesting client (RFC 6749 §10.4)
+            if refresh_data.get("client_id") != client_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "invalid_grant",
+                        "error_description": "Refresh token was not issued to this client",
+                    },
+                )
+
             # Validate resource parameters if provided (RFC 8707)
             if resource:
                 authorized_resources = refresh_data.get("resources", [])
@@ -835,6 +846,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                         "username": refresh_data["username"],
                         "client_id": client_id,
                         "scope": refresh_data["scope"],
+                        "resources": refresh_data.get("resources", []),  # RFC 8707: propagate to rotated token
                     },
                     redis_client,
                 )
@@ -945,6 +957,14 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
         error_description: Optional[str] = Query(None),
     ):
         """User-friendly error page for OAuth flow failures"""
+        safe_error = html.escape(error or "")
+        safe_description = html.escape(error_description or "No additional details available")
+        is_expired = "expired state" in (error_description or "").lower()
+        expiry_message = (
+            "Your authentication session expired. OAuth state tokens are valid for only 5 minutes for security reasons."
+            if is_expired
+            else "The OAuth authentication process encountered an error."
+        )
         return HTMLResponse(
             content=f"""
             <!DOCTYPE html>
@@ -957,14 +977,14 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             </head>
             <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 40px; max-width: 600px; margin: 0 auto;">
                 <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 20px; margin-bottom: 20px;">
-                    <h1 style="color: #dc2626; margin: 0 0 10px 0;">❌ OAuth Authentication Failed</h1>
-                    <p style="font-size: 18px; margin: 0;"><strong>Error:</strong> {error}</p>
-                    <p style="margin: 10px 0 0 0;"><strong>Details:</strong> {error_description or "No additional details available"}</p>
+                    <h1 style="color: #dc2626; margin: 0 0 10px 0;">&#10060; OAuth Authentication Failed</h1>
+                    <p style="font-size: 18px; margin: 0;"><strong>Error:</strong> {safe_error}</p>
+                    <p style="margin: 10px 0 0 0;"><strong>Details:</strong> {safe_description}</p>
                 </div>
 
                 <div style="background: #f3f4f6; border-radius: 8px; padding: 20px; margin-bottom: 20px;">
                     <h2 style="margin: 0 0 10px 0;">What happened?</h2>
-                    <p style="margin: 0;">{"Your authentication session expired. OAuth state tokens are valid for only 5 minutes for security reasons." if "expired state" in (error_description or "").lower() else "The OAuth authentication process encountered an error."}</p>
+                    <p style="margin: 0;">{expiry_message}</p>
                 </div>
 
                 <div style="background: #dbeafe; border: 1px solid #93c5fd; border-radius: 8px; padding: 20px;">
@@ -990,6 +1010,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                 "Cache-Control": "no-cache, no-store, must-revalidate",
                 "Pragma": "no-cache",
                 "Expires": "0",
+                "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
             },
         )
 
@@ -1052,6 +1073,27 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             """,
         )
 
+    def _raise_rfc7592_auth_error(request: Request) -> None:
+        """Raise a standardized RFC 7592 authentication error based on the Authorization header."""
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header:
+            raise HTTPException(
+                status_code=401,
+                detail="Missing authentication",
+                headers={"WWW-Authenticate": 'Bearer realm="auth"'},
+            )
+        elif not auth_header.startswith("Bearer "):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid authentication method",
+                headers={"WWW-Authenticate": 'Bearer realm="auth"'},
+            )
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail="Invalid or expired registration access token",
+            )
+
     # RFC 7592 - Dynamic Client Registration Management Protocol
     @router.get("/register/{client_id}")
     async def get_client_registration(
@@ -1068,24 +1110,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             raise HTTPException(status_code=404, detail="Client not found") from e
 
         if not client:
-            auth_header = request.headers.get("Authorization", "")
-            if not auth_header:
-                raise HTTPException(
-                    status_code=401,
-                    detail="Missing authentication",
-                    headers={"WWW-Authenticate": 'Bearer realm="auth"'},
-                )
-            elif not auth_header.startswith("Bearer "):
-                raise HTTPException(
-                    status_code=401,
-                    detail="Invalid authentication method",
-                    headers={"WWW-Authenticate": 'Bearer realm="auth"'},
-                )
-            else:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Invalid or expired registration access token",
-                )
+            _raise_rfc7592_auth_error(request)
 
         if not await config_endpoint.check_permission(client, request):
             raise HTTPException(status_code=403, detail="Insufficient permissions")
@@ -1108,24 +1133,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             raise HTTPException(status_code=404, detail="Client not found") from e
 
         if not client:
-            auth_header = request.headers.get("Authorization", "")
-            if not auth_header:
-                raise HTTPException(
-                    status_code=401,
-                    detail="Missing authentication",
-                    headers={"WWW-Authenticate": 'Bearer realm="auth"'},
-                )
-            elif not auth_header.startswith("Bearer "):
-                raise HTTPException(
-                    status_code=401,
-                    detail="Invalid authentication method",
-                    headers={"WWW-Authenticate": 'Bearer realm="auth"'},
-                )
-            else:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Invalid or expired registration access token",
-                )
+            _raise_rfc7592_auth_error(request)
 
         if not await config_endpoint.check_permission(client, request):
             raise HTTPException(status_code=403, detail="Insufficient permissions")
@@ -1193,24 +1201,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             raise HTTPException(status_code=404, detail="Client not found") from e
 
         if not client:
-            auth_header = request.headers.get("Authorization", "")
-            if not auth_header:
-                raise HTTPException(
-                    status_code=401,
-                    detail="Missing authentication",
-                    headers={"WWW-Authenticate": 'Bearer realm="auth"'},
-                )
-            elif not auth_header.startswith("Bearer "):
-                raise HTTPException(
-                    status_code=401,
-                    detail="Invalid authentication method",
-                    headers={"WWW-Authenticate": 'Bearer realm="auth"'},
-                )
-            else:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Invalid or expired registration access token",
-                )
+            _raise_rfc7592_auth_error(request)
 
         if not await config_endpoint.check_permission(client, request):
             raise HTTPException(status_code=403, detail="Insufficient permissions")
