@@ -22,6 +22,20 @@ from .rfc7592 import DynamicClientConfigurationEndpoint
 
 # Set up logging
 logger = logging.getLogger(__name__)
+DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+DEVICE_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _auth_base_url(settings: Settings) -> str:
+    """Return the canonical auth service base URL."""
+    return f"https://{settings.auth_subdomain}.{settings.base_domain}"
+
+
+def _generate_user_code() -> str:
+    """Generate a device flow user code without ambiguous characters."""
+    left = "".join(secrets.choice(DEVICE_CODE_CHARS) for _ in range(4))
+    right = "".join(secrets.choice(DEVICE_CODE_CHARS) for _ in range(4))
+    return f"{left}-{right}"
 
 
 def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthManager) -> APIRouter:
@@ -81,11 +95,12 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
     @router.get("/.well-known/oauth-authorization-server")
     async def oauth_metadata():
         """Server metadata shrine - reveals our OAuth capabilities"""
-        api_url = f"https://auth.{settings.base_domain}"
+        api_url = _auth_base_url(settings)
         return {
             "issuer": api_url,
             "authorization_endpoint": f"{api_url}/authorize",
             "token_endpoint": f"{api_url}/token",
+            "device_authorization_endpoint": f"{api_url}/device/code",
             "registration_endpoint": f"{api_url}/register",
             "jwks_uri": f"{api_url}/jwks",
             "response_types_supported": ["code"],
@@ -96,7 +111,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
             "claims_supported": ["sub", "name", "email", "preferred_username", "aud", "azp"],
             "code_challenge_methods_supported": ["S256"],
-            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "grant_types_supported": ["authorization_code", "refresh_token", DEVICE_CODE_GRANT],
             "revocation_endpoint": f"{api_url}/revoke",
             "introspection_endpoint": f"{api_url}/introspect",
             "service_documentation": f"{api_url}/docs",
@@ -120,11 +135,12 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
     @router.get("/.well-known/openid-configuration")
     async def openid_configuration():
         """OpenID Connect Discovery 1.0 endpoint - required by MCP 2025-11-25 spec"""
-        base_url = f"https://{settings.auth_subdomain}.{settings.base_domain}"
+        base_url = _auth_base_url(settings)
         return {
             "issuer": base_url,
             "authorization_endpoint": f"{base_url}/authorize",
             "token_endpoint": f"{base_url}/token",
+            "device_authorization_endpoint": f"{base_url}/device/code",
             "registration_endpoint": f"{base_url}/register",
             "jwks_uri": f"{base_url}/jwks",
             "response_types_supported": ["code"],
@@ -134,7 +150,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
             "claims_supported": ["sub", "name", "email", "preferred_username"],
             "code_challenge_methods_supported": ["S256"],
-            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "grant_types_supported": ["authorization_code", "refresh_token", DEVICE_CODE_GRANT],
             "revocation_endpoint": f"{base_url}/revoke",
             "introspection_endpoint": f"{base_url}/introspect",
             "client_id_metadata_document_supported": True,
@@ -255,7 +271,8 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                 registration.response_types or ["code"]
             ),
             "grant_types": json.dumps(
-                registration.grant_types or ["authorization_code", "refresh_token"]
+                registration.grant_types
+                or ["authorization_code", "refresh_token", DEVICE_CODE_GRANT]
             ),
             "registration_access_token": registration_access_token,
             "token_endpoint_auth_method": token_endpoint_auth_method,
@@ -280,7 +297,8 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             )
 
         # Build registration response per RFC 7591
-        base_url = f"https://{settings.auth_subdomain}.{settings.base_domain}"
+        base_url = _auth_base_url(settings)
+        default_grant_types = ["authorization_code", "refresh_token", DEVICE_CODE_GRANT]
         response = {
             "client_id": client_id,
             "client_id_issued_at": created_at,
@@ -288,7 +306,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             "client_name": client_name,
             "scope": registration.scope or "openid profile email",
             "token_endpoint_auth_method": token_endpoint_auth_method,
-            "grant_types": registration.grant_types or ["authorization_code", "refresh_token"],
+            "grant_types": registration.grant_types or default_grant_types,
             "response_types": registration.response_types or ["code"],
             "registration_access_token": registration_access_token,
             "registration_client_uri": f"{base_url}/register/{client_id}",
@@ -306,6 +324,215 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                 response[field] = value
 
         return response
+
+    @router.post("/device/code")
+    async def device_authorization(
+        client_id: str = Form(...),
+        scope: str = Form("openid profile email"),
+        client_secret: Optional[str] = Form(None),
+        resource: Optional[list[str]] = Form(None),
+        redis_client: redis.Redis = Depends(get_redis),
+    ):
+        """Issue a device code and user code for headless OAuth clients."""
+        client = await auth_manager.get_or_fetch_client(client_id, redis_client)
+        if not client:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "error": "invalid_client",
+                    "error_description": "Client authentication failed",
+                },
+            )
+
+        if not client.check_grant_type(DEVICE_CODE_GRANT):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "unauthorized_client",
+                    "error_description": "Client is not allowed to use the device code grant",
+                },
+            )
+
+        if not client.is_public_client():
+            if not client_secret or not client.check_client_secret(client_secret):
+                raise HTTPException(
+                    status_code=401,
+                    detail={
+                        "error": "invalid_client",
+                        "error_description": "Client authentication failed",
+                    },
+                    headers={"WWW-Authenticate": "Basic"},
+                )
+
+        if resource:
+            for res in resource:
+                if not res.startswith(("http://", "https://")):
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": "invalid_target",
+                            "error_description": "Resource must be a valid URI",
+                        },
+                    )
+
+        device_code = secrets.token_urlsafe(32)
+        user_code = _generate_user_code()
+        verification_uri = f"{_auth_base_url(settings)}/activate"
+        expires_at = int(time.time()) + settings.device_code_lifetime
+        device_data = {
+            "client_id": client_id,
+            "scope": scope,
+            "resources": resource or [],
+            "status": "pending",
+            "user_code": user_code,
+            "expires_at": expires_at,
+            "poll_count": 0,
+            "last_polled_at": 0,
+        }
+
+        await redis_client.setex(
+            f"oauth:device:{device_code}",
+            settings.device_code_lifetime,
+            json.dumps(device_data),
+        )
+        await redis_client.setex(
+            f"oauth:device_user_code:{user_code}",
+            settings.device_code_lifetime,
+            device_code,
+        )
+
+        return {
+            "device_code": device_code,
+            "user_code": user_code,
+            "verification_uri": verification_uri,
+            "verification_uri_complete": f"{verification_uri}?user_code={user_code}",
+            "expires_in": settings.device_code_lifetime,
+            "interval": settings.device_code_interval,
+        }
+
+    @router.get("/activate")
+    async def activate_device_page(user_code: Optional[str] = Query(None)):
+        """Render the device verification page used on a secondary browser."""
+        safe_user_code = html.escape(user_code or "")
+        return HTMLResponse(
+            content=f"""
+            <!DOCTYPE html>
+            <html>
+            <head><title>Activate Device</title></head>
+            <body style="font-family: Arial; padding: 40px; max-width: 640px; margin: 0 auto;">
+                <h1>Authorize Headless Device</h1>
+                <p>Enter the code shown in your CLI or headless environment to continue with GitHub sign-in.</p>
+                <form method="post" action="/activate" style="margin-top: 24px;">
+                    <label for="user_code"><strong>User code</strong></label><br>
+                    <input
+                        id="user_code"
+                        name="user_code"
+                        value="{safe_user_code}"
+                        placeholder="ABCD-EFGH"
+                        style="margin-top: 8px; padding: 12px; font-size: 18px; width: 220px; text-transform: uppercase;"
+                    />
+                    <div style="margin-top: 16px;">
+                        <button type="submit" style="padding: 12px 20px;">Continue</button>
+                    </div>
+                </form>
+            </body>
+            </html>
+            """,
+        )
+
+    @router.post("/activate")
+    async def activate_device(
+        user_code: str = Form(...),
+        redis_client: redis.Redis = Depends(get_redis),
+    ):
+        """Validate the user code and redirect the browser into GitHub OAuth."""
+        normalized_user_code = user_code.strip().upper()
+        device_code = await redis_client.get(f"oauth:device_user_code:{normalized_user_code}")
+        if not device_code:
+            return RedirectResponse(
+                url=(
+                    "/error?"
+                    + urlencode(
+                        {
+                            "error": "invalid_user_code",
+                            "error_description": "The device verification code is invalid or expired.",
+                        }
+                    )
+                ),
+                status_code=302,
+            )
+
+        device_data_str = await redis_client.get(f"oauth:device:{device_code}")
+        if not device_data_str:
+            return RedirectResponse(
+                url=(
+                    "/error?"
+                    + urlencode(
+                        {
+                            "error": "expired_token",
+                            "error_description": "The device verification request has expired.",
+                        }
+                    )
+                ),
+                status_code=302,
+            )
+
+        device_data = json.loads(device_data_str)
+        if device_data["status"] != "pending":
+            return RedirectResponse(
+                url=f"{_auth_base_url(settings)}/device/success",
+                status_code=302,
+            )
+
+        auth_state = secrets.token_urlsafe(32)
+        await redis_client.setex(
+            f"oauth:state:{auth_state}",
+            300,
+            json.dumps(
+                {
+                    "flow_type": "device_code",
+                    "device_code": device_code,
+                    "user_code": normalized_user_code,
+                    "client_id": device_data["client_id"],
+                    "scope": device_data["scope"],
+                    "resources": device_data.get("resources", []),
+                }
+            ),
+        )
+
+        github_params = {
+            "client_id": settings.github_client_id,
+            "redirect_uri": f"{_auth_base_url(settings)}/callback",
+            "scope": "user:email",
+            "state": auth_state,
+        }
+        github_url = f"https://github.com/login/oauth/authorize?{urlencode(github_params)}"
+        return RedirectResponse(
+            url=github_url,
+            status_code=302,
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
+
+    @router.get("/device/success")
+    async def device_success():
+        """Display device authorization completion instructions."""
+        return HTMLResponse(
+            content="""
+            <!DOCTYPE html>
+            <html>
+            <head><title>Device Authorized</title></head>
+            <body style="font-family: Arial; padding: 40px; max-width: 640px; margin: 0 auto;">
+                <h1>Device Authorized</h1>
+                <p>The headless client can return to polling the token endpoint now.</p>
+                <p>You can close this browser window.</p>
+            </body>
+            </html>
+            """,
+        )
 
     # Authorization endpoint
     @router.get("/authorize")
@@ -513,6 +740,19 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
         user_info = await auth_manager.exchange_github_code(code)
 
         if not user_info:
+            if auth_data.get("flow_type") == "device_code":
+                return RedirectResponse(
+                    url=(
+                        "/error?"
+                        + urlencode(
+                            {
+                                "error": "server_error",
+                                "error_description": "GitHub authentication failed for this device request.",
+                            }
+                        )
+                    ),
+                    status_code=302,
+                )
             return RedirectResponse(
                 url=f"{auth_data['redirect_uri']}?error=server_error&state={auth_data['state']}",  # TODO: Break long line
             )
@@ -523,9 +763,60 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
         )
         # If ALLOWED_GITHUB_USERS is set to '*', allow any authenticated GitHub user
         if allowed_users and "*" not in allowed_users and user_info["login"] not in allowed_users:
+            if auth_data.get("flow_type") == "device_code":
+                device_data_str = await redis_client.get(f"oauth:device:{auth_data['device_code']}")
+                if device_data_str:
+                    device_data = json.loads(device_data_str)
+                    device_data["status"] = "denied"
+                    await redis_client.setex(
+                        f"oauth:device:{auth_data['device_code']}",
+                        max(device_data["expires_at"] - int(time.time()), 1),
+                        json.dumps(device_data),
+                    )
+                await redis_client.delete(f"oauth:state:{state}")
+                return RedirectResponse(url=f"{_auth_base_url(settings)}/device/success")
+
             return RedirectResponse(
                 url=f"{auth_data['redirect_uri']}?error=access_denied&state={auth_data['state']}",  # TODO: Break long line
             )
+
+        if auth_data.get("flow_type") == "device_code":
+            device_data_str = await redis_client.get(f"oauth:device:{auth_data['device_code']}")
+            if not device_data_str:
+                return RedirectResponse(
+                    url=(
+                        "/error?"
+                        + urlencode(
+                            {
+                                "error": "expired_token",
+                                "error_description": "The device verification request has expired.",
+                            }
+                        )
+                    ),
+                    status_code=302,
+                )
+
+            device_data = json.loads(device_data_str)
+            device_data.update(
+                {
+                    "status": "approved",
+                    "user_id": str(user_info["id"]),
+                    "username": user_info["login"],
+                    "email": user_info.get("email", ""),
+                    "name": user_info.get("name", ""),
+                    "approved_at": int(time.time()),
+                }
+            )
+            await redis_client.setex(
+                f"oauth:device:{auth_data['device_code']}",
+                max(device_data["expires_at"] - int(time.time()), 1),
+                json.dumps(device_data),
+            )
+            await redis_client.delete(f"oauth:state:{state}")
+            logger.info(
+                f"Approved device authorization for client: {auth_data.get('client_id')}",
+            )
+            return RedirectResponse(url=f"{_auth_base_url(settings)}/device/success")
 
         # Generate authorization code
         auth_code = secrets.token_urlsafe(32)
@@ -584,6 +875,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
         client_secret: Optional[str] = Form(None),
         code_verifier: Optional[str] = Form(None),
         refresh_token: Optional[str] = Form(None),
+        device_code: Optional[str] = Form(None),
         resource: Optional[list[str]] = Form(None),  # RFC 8707 Resource Indicators
         redis_client: redis.Redis = Depends(get_redis),
     ):
@@ -858,6 +1150,142 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                 scope=refresh_data["scope"],
             )
 
+        elif grant_type == DEVICE_CODE_GRANT:
+            if not device_code:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "invalid_request",
+                        "error_description": "Missing device_code",
+                    },
+                )
+
+            device_data_str = await redis_client.get(f"oauth:device:{device_code}")
+            if not device_data_str:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "expired_token",
+                        "error_description": "The device_code is invalid or expired",
+                    },
+                )
+
+            device_data = json.loads(device_data_str)
+            if device_data["client_id"] != client_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "invalid_grant",
+                        "error_description": "The device_code was not issued to this client",
+                    },
+                )
+
+            if device_data["expires_at"] <= int(time.time()):
+                await redis_client.delete(f"oauth:device:{device_code}")
+                await redis_client.delete(f"oauth:device_user_code:{device_data['user_code']}")
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "expired_token",
+                        "error_description": "The device_code has expired",
+                    },
+                )
+
+            now = int(time.time())
+            last_polled_at = int(device_data.get("last_polled_at", 0))
+            if last_polled_at and now - last_polled_at < settings.device_code_interval:
+                device_data["last_polled_at"] = now
+                await redis_client.setex(
+                    f"oauth:device:{device_code}",
+                    max(device_data["expires_at"] - now, 1),
+                    json.dumps(device_data),
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "slow_down",
+                        "error_description": "Poll interval too aggressive",
+                    },
+                )
+
+            device_data["last_polled_at"] = now
+            device_data["poll_count"] = int(device_data.get("poll_count", 0)) + 1
+
+            if device_data["status"] == "pending":
+                await redis_client.setex(
+                    f"oauth:device:{device_code}",
+                    max(device_data["expires_at"] - now, 1),
+                    json.dumps(device_data),
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "authorization_pending",
+                        "error_description": "The user has not completed device authorization yet",
+                    },
+                )
+
+            if device_data["status"] == "denied":
+                await redis_client.delete(f"oauth:device:{device_code}")
+                await redis_client.delete(f"oauth:device_user_code:{device_data['user_code']}")
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "access_denied",
+                        "error_description": "The user denied the device authorization request",
+                    },
+                )
+
+            authorized_resources = device_data.get("resources", [])
+            requested_resources = resource if resource else []
+            if requested_resources:
+                for res in requested_resources:
+                    if res not in authorized_resources:
+                        raise HTTPException(
+                            status_code=400,
+                            detail={
+                                "error": "invalid_target",
+                                "error_description": f"Resource '{res}' was not authorized",
+                            },
+                        )
+                token_resources = requested_resources
+            else:
+                token_resources = authorized_resources
+
+            token_resource = token_resources[0] if token_resources else None
+            access_token = await auth_manager.create_jwt_token(
+                {
+                    "sub": device_data["user_id"],
+                    "username": device_data["username"],
+                    "email": device_data["email"],
+                    "name": device_data["name"],
+                    "scope": device_data["scope"],
+                    "client_id": client_id,
+                    "resources": token_resources,
+                },
+                redis_client,
+                resource=token_resource,
+            )
+            refresh_token_value = await auth_manager.create_refresh_token(
+                {
+                    "user_id": device_data["user_id"],
+                    "username": device_data["username"],
+                    "client_id": client_id,
+                    "scope": device_data["scope"],
+                    "resources": token_resources,
+                },
+                redis_client,
+            )
+            await redis_client.delete(f"oauth:device:{device_code}")
+            await redis_client.delete(f"oauth:device_user_code:{device_data['user_code']}")
+
+            return TokenResponse(
+                access_token=access_token,
+                expires_in=settings.access_token_lifetime,
+                refresh_token=refresh_token_value,
+                scope=device_data["scope"],
+            )
+
         else:
             raise HTTPException(
                 status_code=400,
@@ -867,21 +1295,32 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                 },
             )
 
-    # ForwardAuth verification endpoint - Using ResourceProtector
+    # ForwardAuth verification endpoint - DEPRECATED
+    # Previously used by nginx auth_request subrequest pattern.
+    # The gateway now validates tokens inline via AsyncResourceProtector dependency.
+    # Kept for backward compatibility during transition.
     @router.get("/verify")
     @router.post("/verify")
     async def verify_token(request: Request):
-        """Token examination oracle - validates Bearer tokens for Traefik"""
+        """Token validation for nginx auth_request. Deprecated: use gateway inline auth instead."""
         # Extract the target resource from forwarded headers
         forwarded_host = request.headers.get("x-forwarded-host", "")
         forwarded_proto = request.headers.get("x-forwarded-proto", "https")
         forwarded_path = request.headers.get("x-forwarded-path", "")
-        
+        safe_headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in ("authorization", "cookie", "x-auth-token")
+        }
+        logger.info(
+            f"VERIFY HEADERS - host: {forwarded_host}, proto: {forwarded_proto}, "
+            f"path: {forwarded_path}, headers: {safe_headers}"
+        )
+
         # Construct the resource URI if we have the host
         resource = None
         if forwarded_host:
             resource = f"{forwarded_proto}://{forwarded_host}{forwarded_path}"
-        
+
         # Validate token with resource context
         nonlocal require_oauth
         if require_oauth is None:
@@ -890,10 +1329,10 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                 redis_manager.client,
                 auth_manager.key_manager,
             )
-        
+
         # Validate with resource for audience checking
         token = await require_oauth.validate_request(request, resource=resource)
-        
+
         # Return success with user info in JSON body
         return {
             "sub": token.get("sub", ""),

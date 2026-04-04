@@ -16,7 +16,6 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from .async_resource_protector import create_async_resource_protector
 from .auth_authlib import AuthManager
 from .config import Settings
-from .keys import RSAKeyManager
 from .origin_middleware import OriginValidationMiddleware
 from .proxy import create_proxy_router
 from .redis_client import RedisManager
@@ -255,10 +254,9 @@ def create_app(settings: Settings = None) -> FastAPI:
         app.state.settings = settings
 
         # Initialize async resource protector for inline auth (replaces nginx auth_request)
-        key_manager = RSAKeyManager(settings)
-        redis_client = await redis_manager.get_client()
+        # Reuse auth_manager.key_manager — keys are already loaded at startup
         app.state.require_oauth = create_async_resource_protector(
-            settings, redis_client, key_manager
+            settings, redis_manager.client, auth_manager.key_manager
         )
 
         # Long-lived httpx client for proxying to MCP backends
