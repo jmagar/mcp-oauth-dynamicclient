@@ -8,14 +8,20 @@ import os
 import time
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from .async_resource_protector import create_async_resource_protector
 from .auth_authlib import AuthManager
 from .config import Settings
+from .keys import RSAKeyManager
+from .origin_middleware import OriginValidationMiddleware
+from .proxy import create_proxy_router
 from .redis_client import RedisManager
 from .routes import create_oauth_router
+from .service_registry import ServiceRegistry
 
 log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 log_level = os.environ.get("LOG_LEVEL", "INFO")
@@ -242,8 +248,41 @@ def create_app(settings: Settings = None) -> FastAPI:
         """Manage application lifecycle"""
         # Startup
         await redis_manager.initialize()
+
+        # Initialize service registry for proxy routing
+        registry = ServiceRegistry()
+        app.state.service_registry = registry
+        app.state.settings = settings
+
+        # Initialize async resource protector for inline auth (replaces nginx auth_request)
+        key_manager = RSAKeyManager(settings)
+        redis_client = await redis_manager.get_client()
+        app.state.require_oauth = create_async_resource_protector(
+            settings, redis_client, key_manager
+        )
+
+        # Long-lived httpx client for proxying to MCP backends
+        http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=float(settings.mcp_proxy_connect_timeout),
+                read=float(settings.mcp_proxy_read_timeout),
+                write=60.0,
+                pool=5.0,
+            ),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+            follow_redirects=False,
+        )
+        app.state.http_client = http_client
+
+        if len(registry) > 0:
+            logging.getLogger(__name__).info(
+                "Gateway proxy enabled with %d backend(s)", len(registry)
+            )
+
         yield
+
         # Shutdown
+        await http_client.aclose()
         await redis_manager.close()
 
     # Create FastAPI app
@@ -399,9 +438,17 @@ def create_app(settings: Settings = None) -> FastAPI:
 
         return response
 
+    # Origin validation middleware for proxy routes (DNS rebinding protection)
+    app.add_middleware(OriginValidationMiddleware, allowed_origins_str=settings.mcp_allowed_origins)
+
     # Include OAuth routes with Authlib ResourceProtector for enhanced security
     oauth_router = create_oauth_router(settings, redis_manager, auth_manager)
     app.include_router(oauth_router)
+
+    # Include proxy routes for MCP backend proxying
+    # Mounted AFTER oauth_router so OAuth routes take precedence
+    proxy_router = create_proxy_router()
+    app.include_router(proxy_router)
 
     return app
 

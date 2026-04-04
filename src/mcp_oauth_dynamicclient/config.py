@@ -31,12 +31,19 @@ class Settings(BaseSettings):
     refresh_token_lifetime: int = Field(alias="OAUTH_REFRESH_TOKEN_LIFETIME")
     session_timeout: int = Field(alias="OAUTH_SESSION_TIMEOUT")
     client_lifetime: int = Field(alias="OAUTH_CLIENT_LIFETIME")  # 0 = never expires
+    device_code_lifetime: int = Field(600, alias="OAUTH_DEVICE_CODE_LIFETIME")
+    device_code_interval: int = Field(5, alias="OAUTH_DEVICE_CODE_INTERVAL")
 
     # Access Control
     allowed_github_users: str = Field(alias="OAUTH_ALLOWED_GITHUB_USERS")  # NO DEFAULTS! Comma-separated list
 
     # MCP Protocol Version
     mcp_protocol_version: str = Field(alias="OAUTH_MCP_PROTOCOL_VERSION")  # NO DEFAULTS!
+
+    # Gateway Proxy Settings
+    mcp_allowed_origins: str = Field("", alias="MCP_ALLOWED_ORIGINS")  # Comma-separated extra origin domains
+    mcp_proxy_connect_timeout: int = Field(240, alias="MCP_PROXY_CONNECT_TIMEOUT")  # seconds
+    mcp_proxy_read_timeout: int = Field(86400, alias="MCP_PROXY_READ_TIMEOUT")  # 24h for SSE streams
 
     model_config = ConfigDict(
         env_file=".env",
