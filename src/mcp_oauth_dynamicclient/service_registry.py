@@ -69,11 +69,13 @@ class ServiceRegistry:
 
                 public_base = f"{parsed.scheme}://{parsed.netloc}"
 
-                # Extract path prefix from multi-segment paths only.
-                # '/swag/mcp' (2 segments) -> '/swag'
-                # '/mcp' (1 segment) or '/' or '' -> '' (host-based, no prefix)
+                # Extract path prefix: any first path segment that is not 'mcp' is a prefix.
+                # '/synapse'     -> '/synapse' (path-based, bare endpoint)
+                # '/synapse/mcp' -> '/synapse' (path-based, legacy /mcp suffix)
+                # '/mcp'         -> ''         (host-based, service owns the whole host)
+                # '/' or ''      -> ''         (host-based)
                 path_segments = [s for s in parsed.path.split('/') if s]
-                path_prefix = f'/{path_segments[0]}' if len(path_segments) >= 2 else ''
+                path_prefix = f'/{path_segments[0]}' if path_segments and path_segments[0] != 'mcp' else ''
 
                 service_entry = ServiceEntry(
                     name=service_name,

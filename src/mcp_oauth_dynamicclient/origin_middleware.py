@@ -94,13 +94,15 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
         if path in self.SKIP_PATHS or path.startswith("/register/"):
             return await call_next(request)
 
-        # Detect proxy routes — both host-based and path-based
+        # Detect proxy routes using the service registry where available,
+        # falling back to fixed-path checks for host-based routes.
         is_proxy_route = (
             path in ("/mcp", "/health")
             or path.startswith("/session")
-            or bool(re.match(r"^/[^/]+/mcp$", path))     # /{service}/mcp
-            or bool(re.match(r"^/[^/]+/health$", path))  # /{service}/health
         )
+        if not is_proxy_route and hasattr(request.app.state, "service_registry"):
+            host = request.headers.get("host", "").split(":")[0]
+            is_proxy_route = request.app.state.service_registry.resolve(host, path) is not None
 
         # Only validate origin for proxy-targeted paths
         if is_proxy_route:

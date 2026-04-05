@@ -218,7 +218,7 @@ def create_proxy_router() -> APIRouter:
 
     # --- Path-based routes (registered AFTER fixed routes to avoid prefix capture) ---
 
-    @router.api_route("/{service_name}/mcp", methods=["POST", "GET", "DELETE"])
+    @router.api_route("/{service_name}", methods=["POST", "GET", "DELETE"])
     async def proxy_mcp_path(
         request: Request,
         service_name: str,
@@ -226,7 +226,7 @@ def create_proxy_router() -> APIRouter:
         token: dict[str, Any] = Depends(_authenticate),
         client: httpx.AsyncClient = Depends(_get_http_client),
     ):
-        """Path-based MCP proxy: /{service_name}/mcp → backend /mcp."""
+        """Path-based MCP proxy: /{service_name} → backend /mcp."""
         return await _do_proxy_mcp(request, service, token, client)
 
     @router.get("/{service_name}/health")
