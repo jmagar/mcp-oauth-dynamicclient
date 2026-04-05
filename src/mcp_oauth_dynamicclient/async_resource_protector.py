@@ -36,30 +36,32 @@ class AsyncResourceProtector:
 
         """
         # Build WWW-Authenticate header with metadata URLs (RFC 9728)
-        auth_server_url = f"https://auth.{self.settings.base_domain}"
-        
+        auth_server_url = (
+            f"https://{self.settings.auth_subdomain}.{self.settings.base_domain}"
+        )
+
         # If resource is provided, construct resource metadata URL
         if resource:
-            # Parse resource URL to get host
-            from urllib.parse import urlparse
-            parsed = urlparse(resource)
-            resource_host = parsed.netloc or parsed.path
-            resource_metadata_url = f"{resource}/.well-known/oauth-protected-resource"
+            resource_metadata_url = (
+                f"{resource.rstrip('/')}/.well-known/oauth-protected-resource"
+            )
         else:
             # Use request host as resource
             host = request.headers.get("host", "localhost")
             proto = request.headers.get("x-forwarded-proto", "https")
             resource = f"{proto}://{host}"
-            resource_metadata_url = f"{resource}/.well-known/oauth-protected-resource"
-        
+            resource_metadata_url = (
+                f"{resource.rstrip('/')}/.well-known/oauth-protected-resource"
+            )
+
         www_auth_params = [
             'Bearer',
             f'realm="MCP Server"',
             f'as_uri="{auth_server_url}/.well-known/oauth-authorization-server"',
-            f'resource_uri="{resource_metadata_url}"'
+            f'resource_metadata="{resource_metadata_url}"',
         ]
         www_authenticate = ", ".join(www_auth_params)
-        
+
         # Check if request is valid
         error = self.validator.request_invalid(request)
         if error:
@@ -104,9 +106,14 @@ class AsyncResourceProtector:
             # Normalize audience to list
             if isinstance(aud, str):
                 aud = [aud]
-            
-            # Check if resource is in audience
-            if resource not in aud:
+
+            # Normalize trailing slashes for comparison
+            resource_normalized = resource.rstrip("/")
+            aud_normalized = [a.rstrip("/") for a in aud]
+            # Accept either the specific resource URL or the auth server's own URL
+            # (tokens issued directly by this gateway are valid for all its services)
+            valid_audiences = {resource_normalized, auth_server_url.rstrip("/")}
+            if not any(a in valid_audiences for a in aud_normalized):
                 www_auth_error = www_authenticate.replace('Bearer', 'Bearer error="invalid_audience"')
                 raise HTTPException(
                     status_code=403,
