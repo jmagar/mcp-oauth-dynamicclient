@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Loopback hosts per RFC 8252 Section 7.3
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
+DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 
 
 class OAuth2Client(ClientMixin):
@@ -132,16 +133,15 @@ class AuthManager:
         # Prepare JWT claims according to RFC 7519
         now = datetime.now(timezone.utc)
         header = {"alg": self.settings.jwt_algorithm}
-        
+
         # Handle audience claim for RFC 8707 Resource Indicators
         resources = claims.pop("resources", [])
         if resources:
             # If resources specified, use them as audience (RFC 8707)
             aud = resources if len(resources) > 1 else resources[0]
         else:
-            # Fallback to auth server URL for backward compatibility
-            aud = f"https://auth.{self.settings.base_domain}"
-        
+            aud = audience
+
         payload = {
             **claims,
             "jti": jti,
@@ -457,7 +457,10 @@ class AuthManager:
             "created_at": created_at,
             "response_types": json.dumps(metadata.get("response_types", ["code"])),
             "grant_types": json.dumps(
-                metadata.get("grant_types", ["authorization_code", "refresh_token"])
+                metadata.get(
+                    "grant_types",
+                    ["authorization_code", "refresh_token", DEVICE_CODE_GRANT],
+                )
             ),
             "token_endpoint_auth_method": metadata.get(
                 "token_endpoint_auth_method", "none"

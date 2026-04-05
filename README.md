@@ -22,10 +22,10 @@ A production-ready OAuth 2.1 authorization server with RFC 7591 dynamic client r
 pip install mcp-oauth-dynamicclient
 ```
 
-### Using pixi
+### Using uv
 
 ```bash
-pixi add --pypi mcp-oauth-dynamicclient
+uv tool install mcp-oauth-dynamicclient
 ```
 
 ### Docker Deployment

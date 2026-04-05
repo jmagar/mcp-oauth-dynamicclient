@@ -39,10 +39,11 @@ STRIP_RESPONSE_HEADERS = {
 
 
 async def _get_service(request: Request) -> ServiceEntry:
-    """FastAPI dependency: resolve backend service from Host header."""
+    """FastAPI dependency: resolve backend service from Host header and request path."""
     registry: ServiceRegistry = request.app.state.service_registry
     host = request.headers.get("host", "")
-    service = registry.resolve(host)
+    path = request.url.path
+    service = registry.resolve(host, path)
     if not service:
         raise HTTPException(status_code=404, detail={"error": "unknown_service", "error_description": f"No MCP service registered for host: {host}"})
     return service
@@ -96,9 +97,86 @@ def _get_http_client(request: Request) -> httpx.AsyncClient:
     return request.app.state.http_client
 
 
+async def _do_proxy_mcp(
+    request: Request,
+    service: ServiceEntry,
+    token: dict[str, Any],
+    client: httpx.AsyncClient,
+) -> StreamingResponse:
+    """Shared MCP proxy logic — backend always receives /mcp regardless of incoming path."""
+    backend_url = f"{service.backend_url}/mcp"
+    headers = _build_upstream_headers(request, token)
+
+    logger.info(
+        "PROXY %s %s → %s (user=%s, service=%s)",
+        request.method, request.url.path, backend_url, token.get("username", "?"), service.name,
+    )
+
+    try:
+        upstream_req = client.build_request(
+            request.method,
+            backend_url,
+            headers=headers,
+            content=request.stream() if request.method == "POST" else None,
+        )
+        upstream_resp = await client.send(upstream_req, stream=True)
+    except httpx.ConnectError:
+        logger.error("Backend unreachable: %s", backend_url)
+        raise HTTPException(status_code=502, detail={"error": "backend_unreachable", "error_description": f"MCP backend {service.name} is unreachable"})
+    except httpx.TimeoutException:
+        logger.error("Backend timeout: %s", backend_url)
+        raise HTTPException(status_code=504, detail={"error": "backend_timeout", "error_description": f"MCP backend {service.name} timed out"})
+
+    resp_headers = _build_response_headers(upstream_resp.headers)
+    content_type = upstream_resp.headers.get("content-type", "application/json")
+
+    return StreamingResponse(
+        upstream_resp.aiter_raw(),
+        status_code=upstream_resp.status_code,
+        headers=resp_headers,
+        media_type=content_type.split(";")[0].strip(),
+        background=BackgroundTask(upstream_resp.aclose),
+    )
+
+
+async def _do_proxy_health(
+    service: ServiceEntry,
+    client: httpx.AsyncClient,
+) -> JSONResponse:
+    """Shared health proxy logic."""
+    backend_url = f"{service.backend_url}/health"
+
+    try:
+        resp = await client.get(backend_url, timeout=10.0)
+        return JSONResponse(
+            status_code=resp.status_code,
+            content=resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"status": "ok"},
+        )
+    except (httpx.ConnectError, httpx.TimeoutException):
+        return JSONResponse(
+            status_code=502,
+            content={"error": "backend_unreachable", "error_description": f"MCP backend {service.name} is unreachable"},
+        )
+
+
+def _build_oauth_protected_resource_response(service: ServiceEntry, auth_server: str) -> JSONResponse:
+    """Shared RFC 9728 metadata response builder."""
+    return JSONResponse(
+        content={
+            "resource": service.public_base,
+            "authorization_servers": [auth_server],
+            "scopes_supported": ["mcp:read", "mcp:write"],
+            "bearer_methods_supported": ["header"],
+        },
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 def create_proxy_router() -> APIRouter:
     """Create the proxy router with all MCP proxy routes."""
     router = APIRouter()
+
+    # --- Host-based routes (existing) ---
 
     @router.api_route("/mcp", methods=["POST", "GET", "DELETE"])
     async def proxy_mcp(
@@ -113,39 +191,7 @@ def create_proxy_router() -> APIRouter:
         GET /mcp — SSE notification stream (long-lived)
         DELETE /mcp — Session termination
         """
-        backend_url = f"{service.backend_url}/mcp"
-        headers = _build_upstream_headers(request, token)
-
-        logger.info(
-            "PROXY %s /mcp → %s (user=%s, service=%s)",
-            request.method, backend_url, token.get("username", "?"), service.name,
-        )
-
-        try:
-            upstream_req = client.build_request(
-                request.method,
-                backend_url,
-                headers=headers,
-                content=request.stream() if request.method == "POST" else None,
-            )
-            upstream_resp = await client.send(upstream_req, stream=True)
-        except httpx.ConnectError:
-            logger.error("Backend unreachable: %s", backend_url)
-            raise HTTPException(status_code=502, detail={"error": "backend_unreachable", "error_description": f"MCP backend {service.name} is unreachable"})
-        except httpx.TimeoutException:
-            logger.error("Backend timeout: %s", backend_url)
-            raise HTTPException(status_code=504, detail={"error": "backend_timeout", "error_description": f"MCP backend {service.name} timed out"})
-
-        resp_headers = _build_response_headers(upstream_resp.headers)
-        content_type = upstream_resp.headers.get("content-type", "application/json")
-
-        return StreamingResponse(
-            upstream_resp.aiter_raw(),
-            status_code=upstream_resp.status_code,
-            headers=resp_headers,
-            media_type=content_type.split(";")[0].strip(),
-            background=BackgroundTask(upstream_resp.aclose),
-        )
+        return await _do_proxy_mcp(request, service, token, client)
 
     @router.get("/health")
     async def proxy_health(
@@ -154,19 +200,7 @@ def create_proxy_router() -> APIRouter:
         client: httpx.AsyncClient = Depends(_get_http_client),
     ):
         """Proxy health checks to backend (no auth required)."""
-        backend_url = f"{service.backend_url}/health"
-
-        try:
-            resp = await client.get(backend_url, timeout=10.0)
-            return JSONResponse(
-                status_code=resp.status_code,
-                content=resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"status": "ok"},
-            )
-        except (httpx.ConnectError, httpx.TimeoutException):
-            return JSONResponse(
-                status_code=502,
-                content={"error": "backend_unreachable", "error_description": f"MCP backend {service.name} is unreachable"},
-            )
+        return await _do_proxy_health(service, client)
 
     @router.get("/.well-known/oauth-protected-resource")
     async def oauth_protected_resource(
@@ -178,18 +212,42 @@ def create_proxy_router() -> APIRouter:
         Returns the authorization server metadata for the requested service.
         Previously this was a static JSON block per nginx config file.
         """
-        # Get auth server URL from app settings
         settings = request.app.state.settings
         auth_server = f"https://{settings.auth_subdomain}.{settings.base_domain}"
+        return _build_oauth_protected_resource_response(service, auth_server)
 
-        return JSONResponse(
-            content={
-                "resource": service.public_base,
-                "authorization_servers": [auth_server],
-                "scopes_supported": ["mcp:read", "mcp:write"],
-                "bearer_methods_supported": ["header"],
-            },
-            headers={"Cache-Control": "public, max-age=3600"},
-        )
+    # --- Path-based routes (registered AFTER fixed routes to avoid prefix capture) ---
+
+    @router.api_route("/{service_name}/mcp", methods=["POST", "GET", "DELETE"])
+    async def proxy_mcp_path(
+        request: Request,
+        service_name: str,
+        service: ServiceEntry = Depends(_get_service),
+        token: dict[str, Any] = Depends(_authenticate),
+        client: httpx.AsyncClient = Depends(_get_http_client),
+    ):
+        """Path-based MCP proxy: /{service_name}/mcp → backend /mcp."""
+        return await _do_proxy_mcp(request, service, token, client)
+
+    @router.get("/{service_name}/health")
+    async def proxy_health_path(
+        request: Request,
+        service_name: str,
+        service: ServiceEntry = Depends(_get_service),
+        client: httpx.AsyncClient = Depends(_get_http_client),
+    ):
+        """Path-based health proxy: /{service_name}/health → backend /health (no auth)."""
+        return await _do_proxy_health(service, client)
+
+    @router.get("/{service_name}/.well-known/oauth-protected-resource")
+    async def oauth_protected_resource_path(
+        request: Request,
+        service_name: str,
+        service: ServiceEntry = Depends(_get_service),
+    ):
+        """Path-based RFC 9728 metadata: /{service_name}/.well-known/oauth-protected-resource."""
+        settings = request.app.state.settings
+        auth_server = f"https://{settings.auth_subdomain}.{settings.base_domain}"
+        return _build_oauth_protected_resource_response(service, auth_server)
 
     return router

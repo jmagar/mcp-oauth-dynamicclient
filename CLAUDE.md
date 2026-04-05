@@ -296,8 +296,8 @@ MCP_PROTOCOL_VERSION=2025-06-18
 ### Installation
 
 ```bash
-# Via pixi (blessed!)
-pixi add mcp-oauth-dynamicclient
+# Via uv (blessed!)
+uv tool install mcp-oauth-dynamicclient
 
 # Via pip (if you must)
 pip install mcp-oauth-dynamicclient

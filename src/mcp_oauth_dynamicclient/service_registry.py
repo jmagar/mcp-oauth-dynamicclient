@@ -17,13 +17,14 @@ class ServiceEntry:
     public_host: str    # e.g. "fetch.yourdomain.com" (extracted from public_url)
     public_base: str    # e.g. "https://fetch.yourdomain.com" (no /mcp path)
     backend_url: str    # e.g. "http://100.75.111.118:3000" (from MCP_*_BACKEND)
+    path_prefix: str = ''  # e.g. "/swag" for path-based routing, '' for host-based
 
 
 class ServiceRegistry:
-    """Routes incoming requests to MCP backend services based on Host header."""
+    """Routes incoming requests to MCP backend services based on Host header or path prefix."""
 
     def __init__(self) -> None:
-        self._services: dict[str, ServiceEntry] = {}  # keyed by public_host
+        self._services: dict[str, ServiceEntry] = {}  # keyed by public_host or host|/prefix
         self._load_from_env()
 
     def _load_from_env(self) -> None:
@@ -68,15 +69,27 @@ class ServiceRegistry:
 
                 public_base = f"{parsed.scheme}://{parsed.netloc}"
 
+                # Extract path prefix from multi-segment paths only.
+                # '/swag/mcp' (2 segments) -> '/swag'
+                # '/mcp' (1 segment) or '/' or '' -> '' (host-based, no prefix)
+                path_segments = [s for s in parsed.path.split('/') if s]
+                path_prefix = f'/{path_segments[0]}' if len(path_segments) >= 2 else ''
+
                 service_entry = ServiceEntry(
                     name=service_name,
                     public_url=public_url,
                     public_host=public_host,
                     public_base=public_base,
-                    backend_url=backend_url
+                    backend_url=backend_url,
+                    path_prefix=path_prefix,
                 )
 
-                self._services[public_host] = service_entry
+                if path_prefix:
+                    registry_key = f'{public_host}|{path_prefix}'
+                else:
+                    registry_key = public_host
+
+                self._services[registry_key] = service_entry
                 registered_count += 1
 
             except Exception as e:
@@ -85,15 +98,28 @@ class ServiceRegistry:
 
         logger.info(f"Service registry loaded {registered_count} services: {list(self._services.keys())}")
 
-    def resolve(self, host: str) -> ServiceEntry | None:
-        """Look up a backend service by Host header value.
+    def resolve(self, host: str, path: str = '') -> ServiceEntry | None:
+        """Look up a backend service by Host header value and optional request path.
 
         Strips port from host if present (e.g. "fetch.example.com:443" -> "fetch.example.com").
+        If path is provided, tries compound key "host|/prefix" first (path-based routing),
+        then falls back to plain host key (host-based routing).
         """
         # Strip port if present
         if ':' in host:
             host = host.split(':')[0]
 
+        # Try path-based routing first when path is provided
+        if path:
+            parts = path.split('/')
+            # parts[0] is empty string before leading slash; parts[1] is first segment
+            if len(parts) > 1 and parts[1]:
+                compound_key = f'{host}|/{parts[1]}'
+                service = self._services.get(compound_key)
+                if service is not None:
+                    return service
+
+        # Fall back to host-based routing
         return self._services.get(host)
 
     def all_services(self) -> list[ServiceEntry]:
