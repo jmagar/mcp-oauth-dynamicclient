@@ -16,7 +16,7 @@ class ServiceEntry:
     public_url: str     # e.g. "https://fetch.yourdomain.com/mcp" (from MCP_*_URLS)
     public_host: str    # e.g. "fetch.yourdomain.com" (extracted from public_url)
     public_base: str    # e.g. "https://fetch.yourdomain.com" (no /mcp path)
-    backend_url: str    # e.g. "http://100.75.111.118:3000" (from MCP_*_BACKEND)
+    backend_url: str    # e.g. "http://198.51.100.1:3000" (from MCP_*_BACKEND)
     path_prefix: str = ''  # e.g. "/swag" for path-based routing, '' for host-based
 
 
